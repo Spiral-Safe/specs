@@ -12,19 +12,40 @@ only to this adapter, never directly to Vault.
 All wallet routes require:
 
 ```http
-Authorization: Bearer <tenant-and-username-scoped-api-token>
+Authorization: Bearer <account-scoped-api-key>
 Content-Type: application/json
 ```
 
-The adapter hashes the supplied token with SHA-256 and maps it to a principal
-configured by the operator. It injects that principal's tenant into every
-Vault request; a body field named `tenant` has no effect. It also rejects a
-username outside the principal's allowlist with `403 user_forbidden` before
-making any Vault request.
+### Account-backed production API keys
 
-The preferred production configuration is `API_TOKEN_HASHES`, a JSON object
-whose keys are 64-character SHA-256 token digests and whose values have this
-shape:
+With production `BILLING_MODE=postgres`, API keys are issued from the developer
+console with an `ssk_live_...` prefix and a cryptographically random secret.
+The secret appears once. PostgreSQL stores only its non-secret prefix and an
+HMAC-SHA-256 digest under `API_KEY_PEPPER`, along with the owning account,
+tenant, username allowlist, scopes, last-use time, and revocation state.
+
+Authentication derives all of these server-side. A caller cannot select an
+account, tenant, role, scope, or additional username in the request body. The
+service rejects an unauthorized username or missing scope with 403 before
+Vault, an inactive account with `402 payment_required`, and a Metronome-enabled
+account without a recorded per-account Stripe mapping with
+`402 billing_provisioning_required`.
+
+Available scopes are:
+
+| Scope | Routes |
+| --- | --- |
+| `wallets:read` | `/check` |
+| `wallets:write` | `/init`, `/create` |
+| `signatures:create` | `/signin`, `/complete` |
+
+Production billing rejects `API_TOKEN_HASHES`, `API_TOKENS`, and `API_TOKEN`
+rather than mixing database-issued and static credentials.
+
+### Billing-disabled and development tokens
+
+When the account layer is disabled, `API_TOKEN_HASHES` maps 64-character
+SHA-256 token digests to static principals:
 
 ```json
 {
@@ -41,6 +62,24 @@ principal value shape with plaintext tokens as keys; a single `API_TOKEN` uses
 `SERVICE_DEV_MODE=true`, plaintext API tokens must be at least 24 characters.
 Development mode alone accepts the legacy string tenant mapping or a missing
 `API_USERS` list as an explicit tenant-wide wildcard.
+
+The adapter injects the authenticated tenant into every Vault request; a body
+field named `tenant` has no effect. It rejects a username outside the
+credential's allowlist with `403 user_forbidden` before making a Vault request.
+
+### Console sessions
+
+Developer and admin pages do not use wallet API keys as browser sessions.
+`POST /developer/login` and `POST /admin/login` verify the stored role and
+scrypt password hash, then set a random opaque session cookie. Only a keyed
+token hash is stored server-side. The cookie is HttpOnly, SameSite=Strict, and
+Secure outside memory development mode. Mutating console forms additionally
+require a session-derived CSRF token and exact `CONSOLE_ORIGIN`.
+
+Role and account identity come from the stored session, not form fields. A
+developer session is bound to one account; an admin session has no account and
+can create/inspect accounts. These sessions are not accepted in
+`Authorization` for wallet routes.
 
 API tokens are application credentials, not Vault tokens. The service uses
 either:
@@ -78,14 +117,37 @@ used as the protocol user handle.
 | Method and path | Success | Meaning |
 | --- | --- | --- |
 | `GET /healthz` | `200 {"status":"ok"}` | The Node process can serve HTTP. It does not prove Vault is usable. |
-| `GET /readyz` | `200 {"status":"ready"}` | The service can obtain its Vault credential and Vault reports an active or acceptable standby state. Returns 503 otherwise. |
+| `GET /readyz` | `200 {"status":"ready"}` | Vault is usable and, when billing is enabled, the account store is ready. Returns 503 otherwise. |
 
 No bearer token is required for probes.
 
+Wallet authorization and metering are:
+
+| Route | Required scope | Successful-use metric with billing enabled |
+| --- | --- | --- |
+| `/init` | `wallets:write` | none; it may create an incomplete key-bearing record |
+| `/create` | `wallets:write` | first `active_wallet` for tenant/user/chain in the account period |
+| `/check` | `wallets:read` | first `active_wallet` for tenant/user/chain in the account period |
+| `/signin` | `signatures:create` | first `active_wallet` for tenant/user/chain in the account period |
+| `/complete` | `signatures:create` | one `transaction_signed` only when `operation=transaction`, keyed by the one-time ceremony ID; message completion has no transaction unit |
+
+For transaction completion, the adapter reserves quota before the Vault call,
+commits only after Vault succeeds and returns the same trusted stored
+operation, and cancels a newly created reservation when Vault fails or the
+operation differs. Message completion creates no `transaction_signed`
+reservation. Commit also creates the durable Metronome outbox record. If Vault
+succeeds but commit fails, the response fails and the reservation remains for
+reconciliation/expiry; the service does not falsely cancel it. A duplicate
+reservation still in progress returns 409 before a second Vault call; a
+committed `/complete` retry returns `usage_already_committed` and cannot create
+a second outbox record. Reservations also require the current time to fall
+inside the stored account billing period; an expired/missing provider period
+returns 402 until a verified Stripe webhook refreshes it.
+
 ### `POST /init`
 
-Starts registration and creates a chain key if the wallet record does not
-exist.
+Requires `wallets:write`. It starts registration and creates a chain key if the
+wallet record does not exist. `/init` itself is not a committed usage unit.
 
 ```json
 {"username":"alice","chain":"solana"}
@@ -107,7 +169,9 @@ wallet starts another bounded registration ceremony.
 
 ### `POST /create`
 
-Completes exactly one registration ceremony.
+Requires `wallets:write`. It completes exactly one registration ceremony and,
+on success, commits the period's active-wallet unit if this is the first
+successful action for that wallet.
 
 ```json
 {
@@ -144,7 +208,8 @@ forwards a registration credential to Vault.
 
 ### `POST /check`
 
-Looks up a completed tenant/user/chain wallet:
+Requires `wallets:read`. It looks up a completed tenant/user/chain wallet and,
+on success, commits the period's active-wallet unit if needed:
 
 ```json
 {"username":"alice","chain":"ethereum"}
@@ -159,8 +224,9 @@ An unknown wallet returns 404; an initialized but unregistered wallet returns
 
 ### `POST /signin`
 
-Begins WebAuthn authorization and binds the exact signing request to the new
-ceremony:
+Requires `signatures:create`. It begins WebAuthn authorization, binds the exact
+signing request to the new ceremony, and on success commits the period's
+active-wallet unit if needed:
 
 ```json
 {
@@ -183,12 +249,17 @@ errors rather than returning a signature; only legacy transactions are signed.
 
 ### `POST /complete`
 
-Completes the signing ceremony:
+Requires `signatures:create`. It reserves a signed-transaction unit, completes
+the signing ceremony, and commits that unit only for `operation=transaction`
+after Vault returns the signature and its stored operation matches the request.
+Message completion uses the same one-time Vault ceremony protection but does
+not consume a transaction unit:
 
 ```json
 {
   "username": "alice",
   "chain": "solana",
+  "operation": "transaction",
   "ceremonyId": "<id returned by /signin>",
   "credential": {
     "id": "<base64url>",
@@ -204,8 +275,13 @@ Completes the signing ceremony:
 }
 ```
 
-The operation and payload are recovered from server-side ceremony state; the
-client cannot replace them during completion.
+`operation` defaults to `transaction` for backward compatibility. The client
+must send `message` for a message ceremony. Vault recovers the operation and
+payload from its stored ceremony, consumes the ceremony, rejects a requested
+operation mismatch before signing, and returns the stored operation on success.
+The adapter independently compares that returned value before exposing output
+or committing transaction usage. The client cannot replace the stored
+operation or payload during completion.
 
 The adapter requires the common credential fields plus
 `response.authenticatorData` and `response.signature` before forwarding an
@@ -226,6 +302,76 @@ updated authenticator signature counter. If a previously nonzero counter
 regresses, it stores the credential's clone-warning/disabled state, returns a
 rejection without signing, and rejects later authentication starts for that
 wallet until a recovery path exists.
+
+## Account console and billing routes
+
+These routes exist only when the billing runtime is enabled. Console HTML forms
+use `application/x-www-form-urlencoded`; authenticated mutations require the
+session cookie, exact configured origin, and CSRF field.
+
+| Method and path | Authorization | Purpose |
+| --- | --- | --- |
+| `GET /developer/login`, `POST /developer/login` | public form / developer credentials | Start a developer role session. |
+| `POST /developer/logout` | developer session + CSRF | Delete the server-side session. |
+| `GET /developer` | developer session | Show the session account, plan/status, current usage/limits/estimates, API-key metadata, and subscription actions. |
+| `GET /developer/api/usage` | developer session | Return the current account's period and daily usage JSON. |
+| `POST /developer/api-keys` | developer session + CSRF | Create a name/users/scopes-constrained key. Returns its plaintext exactly once. |
+| `POST /developer/api-keys/:id/revoke` | developer session + CSRF | Revoke a key owned by the session account. |
+| `POST /developer/billing/checkout` | developer session + CSRF | Redirect to hosted subscription Checkout; refuses a parallel subscription. |
+| `POST /developer/billing/portal` | developer session + CSRF | Redirect an existing Stripe customer to the hosted Customer Portal. |
+| `GET /admin/login`, `POST /admin/login` | public form / admin credentials | Start an admin role session. |
+| `POST /admin/logout` | admin session + CSRF | Delete the server-side session. |
+| `GET /admin` | admin session | Show aggregate usage/delivery state, account list/create form, and optional redacted account detail; email and raw Stripe/Metronome identifiers are omitted. |
+| `GET /admin/api/analytics` | admin session | Return aggregate and per-account usage without account email fields. |
+| `POST /admin/accounts` | admin session + CSRF | Atomically create a past-due account and its first developer. |
+| `POST /admin/accounts/:id/metronome-verified` | admin session + CSRF | Atomically compare and record the submitted Stripe customer, Metronome ingest alias, local plan, and rate card; requires a configured Metronome runtime. |
+
+There is no administrator bootstrap HTTP endpoint. The operator-only
+`billing:bootstrap-admin` command upserts an account-independent admin from a
+bounded regular password file, rejects password arguments/symlinks, and cannot
+promote a developer. There is still no SSO, MFA, forced password change/reset,
+or credential-recovery flow. Seeded developer/admin credentials exist only in
+explicit development memory mode and are rejected in production.
+
+### Stripe boundary
+
+`POST /billing/stripe/webhook` is outside browser-session and bearer auth. It
+accepts at most 1 MiB of raw `application/json`, verifies `Stripe-Signature`
+against `STRIPE_WEBHOOK_SECRET`, and atomically claims event IDs. It processes
+`checkout.session.completed` and subscription created/updated/deleted events,
+retrieves current subscription state rather than trusting event order, and
+requires exactly one subscription item whose current Stripe Price maps uniquely
+to one local plan before updating account status, customer, subscription, plan,
+and billing period.
+Invalid signatures return 400; an in-progress duplicate returns 503 and other
+processing failures return 500 so Stripe can retry.
+
+The Stripe 22.4.0 client pins API version `2026-07-29.dahlia`. Checkout sends
+one operator-configured base Price, an account/plan metadata binding, a stable
+account/intent-version idempotency key, and
+`spiral_safe_<eight-lowercase-letters>` as `integration_identifier`. It
+intentionally sets neither `payment_method_types` nor `automatic_tax`.
+Distinct Stripe Products/Prices and all tax decisions are operator inputs.
+
+### Metronome outbox boundary
+
+The service exporter posts arrays of 1–100 records to
+`https://api.metronome.com/v1/ingest` (or the configured HTTPS endpoint). Each
+record has a deterministic `transaction_id`, account ingest alias as
+`customer_id` (using the attested alias snapshot once present),
+`spiral_active_wallet` or `spiral_transaction_signed` event type, RFC3339
+timestamp, and string-valued properties. Network errors, 429, and
+5xx retry with bounded exponential backoff; other 4xx responses become
+dead-letter records visible to administrators. Export runs asynchronously and
+never delays a successful signing response.
+
+Metronome ingest does not by itself prove or create a Stripe charge. The
+operator must provision and test each customer's Metronome contract/rate-card
+and Stripe provider mapping, then record the in-service attestation. The store
+atomically compares and snapshots the submitted Stripe customer, Metronome
+ingest alias, local plan, and Metronome rate card; changing any of them or
+clearing a terminal subscription makes it non-current. No live Stripe charge is
+part of the current verification record.
 
 ## Ceremony guarantees
 
@@ -270,16 +416,20 @@ Common statuses:
 | ---: | --- |
 | 400 | invalid username, chain, operation, payload, ceremony ID, credential shape, or JSON |
 | 401 | missing or invalid bearer token |
-| 403 | browser origin outside the exact CORS allowlist, or token not authorized for the requested username |
+| 402 | inactive subscription (`payment_required`) or missing per-account usage-invoicing attestation (`billing_provisioning_required`) |
+| 403 | browser origin outside the exact CORS allowlist, username not authorized, or API key missing the route scope |
 | 404 | route or wallet not found |
-| 409 | wallet already registered or registration incomplete |
+| 409 | wallet already registered, registration incomplete, matching usage still reserved (`usage_in_progress`), or signed ceremony usage already committed (`usage_already_committed`) |
 | 422 | Vault/WebAuthn rejected credential, operation, or ceremony |
-| 429 | local per-tenant/IP rate limit exceeded; see `Retry-After` |
+| 429 | local per-tenant/IP rate limit or plan quota exceeded; request limiting sets `Retry-After` |
 | 502 | Vault failure not safely attributable to the client |
 | 503 | readiness failure |
 
 Responses set `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
-and `Referrer-Policy: no-referrer`.
+and a restrictive Content Security Policy. Wallet API responses use
+`Referrer-Policy: no-referrer`; console/login/CSS responses use `same-origin`
+so native same-origin form submissions retain an Origin boundary. Production
+also sets HSTS.
 
 ## Limits and CORS
 
@@ -290,11 +440,20 @@ and `Referrer-Policy: no-referrer`.
 | `RATE_LIMIT_WINDOW_MS` | 60000 | process-local window |
 | `RATE_LIMIT_MAX` | 60 production / 300 dev | requests per tenant and client IP |
 | `RATE_LIMIT_BUCKETS` | 10000 | memory bound for limiter keys |
+| console form parser | 32 KiB | `/developer` and `/admin` URL-encoded forms |
+| `CONSOLE_SESSION_TTL_MS` | 28800000 (8 hours) | stored role session and cookie |
+| `BILLING_RESERVATION_TTL_MS` | 300000 (5 minutes); accepted range 60000–3600000 | ambiguous uncommitted usage reservation |
+| Stripe webhook raw body | 1 MiB | signature-verified webhook only |
+| `METRONOME_BATCH_SIZE` | 100, capped at 100 | asynchronous outbox claim/ingest batch |
 
 `CORS_ALLOWED_ORIGINS` is required. Production accepts exact HTTPS and
 `chrome-extension://` origins. Development additionally permits extension
 origins so unpacked extension IDs do not have to be committed. Requests without
 an `Origin` header, such as server-side SDK calls, are allowed.
+
+`CONSOLE_ORIGIN` is a separate exact HTTPS origin in production and is added to
+CORS for console-adjacent requests. Native login and mutating forms require
+that exact `Origin`; `Origin: null` is rejected.
 
 The process-local limiter is a protective backstop, not a global quota across
 replicas. A production ingress needs a centralized limit.
@@ -307,7 +466,7 @@ The adapter calls a secrets engine mounted at `spiral-safe/`:
 | --- | --- | --- |
 | `spiral-safe/users` | create/update/read | identity, optional `ceremonyId` and registration `credential` |
 | `spiral-safe/check` | create/update | identity |
-| `spiral-safe/auth` | create/update | identity; begin uses `operation` and `payload`; complete uses `ceremonyId` and assertion `credential` |
+| `spiral-safe/auth` | create/update | identity; begin uses `operation` and `payload`; complete uses requested `operation`, `ceremonyId`, and assertion `credential`, while Vault enforces its stored operation |
 
 Both create and update are deliberately registered for write-style paths so
 the callback is reachable through Vault framework routing regardless of the

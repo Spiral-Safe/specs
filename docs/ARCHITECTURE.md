@@ -14,9 +14,13 @@ flowchart LR
         BG[Extension service worker]
         AUTH[Platform or roaming authenticator]
         DEMO[Service demo / SDK client]
+        CONSOLE[Developer / admin console]
     end
 
     API[Authenticated HTTP adapter]
+    BILL[(PostgreSQL accounts, sessions,<br/>usage and outbox)]
+    MET[Metronome usage rating]
+    STRIPE[Stripe Checkout, Portal<br/>and invoicing]
     VAULT[HashiCorp Vault]
     PLUGIN[Spiral Safe secrets plugin]
     STORE[(Vault encrypted storage)]
@@ -27,17 +31,25 @@ flowchart LR
     CS <-->|tab/frame sender metadata| BG
     INJ <-->|WebAuthn create/get| AUTH
     DEMO <-->|WebAuthn create/get| AUTH
-    BG -->|username-scoped bearer token + JSON| API
-    DEMO -->|username-scoped bearer token + JSON| API
+    BG -->|account/scoped bearer API key + JSON| API
+    DEMO -->|account/scoped bearer API key + JSON| API
+    CONSOLE <-->|role session + CSRF| API
+    API <-->|accounts, hashed keys, reservations| BILL
+    BILL -->|asynchronous committed usage| MET
+    MET -->|usage invoices after external mapping| STRIPE
+    CONSOLE -->|hosted Checkout / Portal| STRIPE
+    STRIPE -->|signature-verified webhook| API
     API -->|short-lived or dev Vault token| VAULT
     VAULT <-->|external plugin RPC| PLUGIN
     PLUGIN <-->|seal-wrapped logical entry| STORE
     BG -->|signed transaction only| RPC
 ```
 
-The service demo and TypeScript SDK are alternative clients of the same HTTP
+The service demo and TypeScript SDK are alternative clients of the same wallet
+HTTP contract. The developer/admin HTML consoles use a separate session
 contract. The browser extension is Solana-specific; Ethereum is exposed through
-the service demo and SDK.
+the service demo and SDK. Metronome and Stripe are billing dependencies, never
+part of the cryptographic signing path.
 
 ## Security and trust boundaries
 
@@ -47,7 +59,11 @@ the service demo and SDK.
 | injected page ↔ content script | versioned bridge messages with page-generated request IDs | extension storage or privileged Chrome APIs |
 | content script ↔ service worker | validated request plus browser-supplied tab/frame/origin identity | caller-selected sender identity |
 | service worker ↔ HTTP service | exact allowlisted-origin request, tenant/username-scoped bearer token, user/chain/operation/payload | Vault credentials and private keys |
+| console browser ↔ HTTP service | password login, opaque server-side session cookie, CSRF token, account/usage metadata, one-time API-key reveal | Vault token, wallet key, another role/account selected by the browser |
 | HTTP service ↔ Vault | server-injected tenant and a least-privilege Vault token | caller-provided tenant or Vault token |
+| HTTP service ↔ PostgreSQL | accounts, role users, hashed API keys/session tokens, plans, reservations, usage/outbox and Stripe identifiers | plaintext API-key/session secrets and wallet private keys |
+| outbox ↔ Metronome | stable transaction ID, customer alias, event type, RFC3339 time, string-valued usage properties | signing payload, WebAuthn credential, wallet private key |
+| Stripe ↔ HTTP service | hosted Checkout/Portal URL, signed webhook, account/plan metadata, customer/subscription state | API-key pepper, session secret, wallet key, unverified webhook body |
 | Vault ↔ plugin storage | gob-encoded wallet, credential, and bounded ceremony state | plaintext storage outside Vault's barrier |
 | enclave ↔ EC2 parent | Veil tunnel, TLS/attestation material, encrypted application traffic | unprotected Vault state, recovery keys, embedded cloud credentials |
 
@@ -79,25 +95,122 @@ Every wallet record is identified by:
 authenticated tenant / username / chain
 ```
 
-In production, each HTTP bearer token maps to an operator-configured principal
-of the form `{tenant, users:[...]}`. The service injects the tenant and checks
-the requested username against that token's non-empty allowlist before calling
-Vault; a body-selected tenant is ignored and an unauthorized username returns
-403 without reaching Vault. Development mode may intentionally use a
-tenant-wide wildcard for the disposable local token. Usernames and tenant
-identifiers are limited to 1–64 characters from `A-Z a-z 0-9 . _ @ -`; the
-first character must be alphanumeric. Supported chains are `solana` and
-`ethereum`.
+The wallet API and account consoles deliberately use different credentials:
+
+- with production billing enabled, a bearer API key resolves a PostgreSQL
+  account, tenant, non-empty username allowlist, and any combination of
+  `wallets:read`, `wallets:write`, and `signatures:create`; the key is revealed
+  once and only an HMAC-SHA-256 digest under `API_KEY_PEPPER` is stored;
+- the legacy operator-supplied `{tenant, users:[...]}` token map remains for a
+  billing-disabled deployment, and the disposable development profile has a
+  known tenant-wide token; production billing rejects every static token map;
+- developer and admin browsers authenticate with password-derived, server-side
+  sessions. The opaque random token is held in an HttpOnly, SameSite=Strict,
+  Secure-in-production cookie and its keyed hash is stored. A session is not
+  accepted as wallet API bearer authorization.
+
+The service injects the authenticated tenant, enforces API-key scope, and
+checks the requested username before calling Vault; a body-selected tenant is
+ignored and an unauthorized username returns 403 without reaching Vault.
+Inactive accounts and unverified usage-invoicing mappings fail before Vault
+with 402. Development mode may intentionally use a tenant-wide wildcard for
+the disposable local token. Usernames and tenant identifiers are limited to
+1–64 characters from `A-Z a-z 0-9 . _ @ -`; the first character must be
+alphanumeric. Supported chains are `solana` and `ethereum`.
 
 The plugin derives the WebAuthn user handle as a deterministic SHA-256 digest
 of tenant, username, and chain, encoded as 43-byte base64url. This keeps the
 handle inside WebAuthn's 64-byte limit while preserving identity and chain
 separation.
 
-The username allowlist closes the prototype's arbitrary-username access, but a
-static application token is not a human session. OIDC/session issuance,
-rotation and revocation, recovery, delegated administration, and centralized
-rate limiting remain product work.
+The account console now supplies developer/admin roles and API-key creation and
+revocation, but it is a password-based product-local identity store. A separate
+operator CLI can create or rotate an account-independent admin from a mounted
+password file; it rejects plaintext password arguments and cannot promote a
+developer. SSO/OIDC, MFA, forced password change/reset, wallet recovery,
+delegated approvals, centralized rate limiting, and a complete identity
+lifecycle remain product work.
+
+## Account, subscription, and usage flow
+
+Plans define a base Stripe Product/Price, an active-wallet limit and operator
+estimate, a signed-transaction limit and estimate, and distinct Metronome
+Product/rate-card IDs. The checked-in `sandbox`, `launch`, and `scale` plans are
+zero-price memory fixtures, not production pricing.
+
+```mermaid
+sequenceDiagram
+    participant C as API-key client
+    participant A as HTTP adapter
+    participant D as PostgreSQL
+    participant V as Vault plugin
+    participant M as Metronome exporter
+    participant S as Stripe invoicing
+
+    C->>A: wallet operation
+    A->>D: reserve account/period/idempotency usage
+    alt quota, subscription, or mapping rejected
+        D-->>A: fail closed
+        A-->>C: 402 / 409 / 429 before Vault
+    else reservation accepted
+        A->>V: authenticated wallet request
+        alt Vault operation fails
+            A->>D: cancel newly created reservation
+            A-->>C: wallet/Vault error
+        else Vault operation succeeds
+            A->>D: commit usage + durable outbox record
+            A-->>C: wallet/signature result
+            D-->>M: asynchronous outbox claim
+            M->>M: rate plan/contract
+            M->>S: usage invoice through provisioned provider mapping
+        end
+    end
+```
+
+`/create`, `/check`, and `/signin` reserve `active_wallet`; the idempotency key
+is the account billing-period start plus a domain-separated HMAC-SHA-256 of
+tenant, username, and chain under the billing pepper. Only the first successful
+action for that wallet in the period is
+committed. For `operation=transaction`, `/complete` reserves
+`transaction_signed` with the single-use ceremony ID, so a successful
+transaction signature commits exactly one transaction unit. Message signatures
+do not consume transaction units. Vault compares the requested completion
+operation to the operation stored with the ceremony before signing and returns
+that trusted value; the adapter also requires an exact match before exposing
+output or committing usage. Transaction reservations count toward quota. A
+newly created reservation is cancelled if Vault rejects the operation or the
+returned operation differs; a stale reservation is discarded after the
+configured TTL. If Vault succeeds but commit fails, the request fails and the
+reservation stays intact instead of being falsely cancelled; the signature
+result is not returned. If the process dies in that window, the system
+eventually underbills rather than inventing a charge from ambiguous state;
+reconciliation is still an operator procedure. Message completion relies on
+Vault's one-time ceremony replay protection rather than the billing reservation
+gate. A missing or expired local billing period fails closed with 402 until a
+verified Stripe webhook refreshes it.
+
+Commit and outbox insertion are one PostgreSQL statement. The exporter does not
+block signing: it sends 1–100 stable `spiral_active_wallet` or
+`spiral_transaction_signed` events, retries network/429/5xx responses with
+bounded backoff, and dead-letters other 4xx responses. Metronome ingest alone
+does not create a Stripe charge. The external per-account
+Metronome-customer/contract/rate-card to Stripe-customer mapping must be
+provisioned, sandbox-invoiced, and then attested by an administrator. The store
+atomically compares and snapshots the submitted Stripe customer, Metronome
+ingest alias, local plan, and Metronome rate card; a change to that tuple or a
+terminal subscription makes it non-current. It is still an operator assertion,
+not a remote verification. Until it exists and remains current, production
+requests return `402 billing_provisioning_required`.
+
+The developer console creates hosted subscription Checkout and Customer Portal
+sessions. Checkout uses one configured base Price and does not force payment
+methods or automatic tax. Raw-body Stripe webhooks are signature verified,
+claimed idempotently, and retrieve current subscription state before updating
+the account. A subscription must contain exactly one base item whose current
+Stripe Price maps uniquely to a local plan; Portal plan changes therefore use
+current provider state rather than stale event metadata. No live Checkout,
+webhook, invoice, tax, or charge has been executed as part of the repository
+verification.
 
 ## Registration ceremony
 
@@ -160,11 +273,14 @@ sequenceDiagram
     W-->>P: assertion credential
     P->>E: sign.complete {ceremonyId, credential}
     E->>E: Verify original browser binding
-    E->>A: POST /complete
-    A->>V: auth {tenant, username, chain, ceremonyId, credential}
-    V->>V: Consume ID; validate assertion; update sign counter
+    E->>A: POST /complete {operation, ceremonyId, credential}
+    A->>V: auth {tenant, username, chain, operation, ceremonyId, credential}
+    V->>V: Consume ID; require stored operation match; validate assertion; update sign counter
     V->>V: Select chain signer and sign bound payload
-    V-->>P: encodedTX or signature
+    V-->>A: stored operation + encodedTX or signature
+    A->>A: Require operation match; commit transaction usage when applicable
+    A-->>E: encodedTX or signature
+    E-->>P: encodedTX or signature
     opt Wallet Standard sign-and-send
         E->>R: sendTransaction(signed transaction)
         R-->>P: network signature
@@ -239,9 +355,11 @@ reviewed one-off process or re-registered.
 
 Compose runs one Vault dev server, one HTTP adapter, and one browser demo.
 Vault uses in-memory storage and the known root token `root`; the API uses a
-known development bearer token. Published host ports are loopback-only, and
-the service/client images run without root; this mode is still for onboarding
-and tests only.
+known development bearer token. The account layer is also in memory with
+zero-price fixture plans and known developer/admin credentials; Stripe and
+Metronome are disabled. Published host ports are loopback-only, and the
+service/client images run without root; this mode is still for onboarding and
+tests only.
 
 The local demo serves bundled JavaScript and CSS without CDN dependencies,
 renders errors as text, and sets a restrictive CSP and related browser security
@@ -255,6 +373,10 @@ devnet RPC. Both Node images use the same pinned Node 22 image digest.
 flowchart TB
     IN[Ingress / Gateway<br/>operator supplied]
     A[HTTP adapter replicas]
+    MIG[Billing migration init container]
+    PG[(External PostgreSQL)]
+    MET[Metronome ingest]
+    STRIPE[Stripe hosted billing]
     K8S[Kubernetes auth]
     VS[vault-active Service]
     V0[(vault-0 PVC)]
@@ -264,6 +386,12 @@ flowchart TB
     BACKUP[External snapshots / audit sink<br/>operator supplied]
 
     IN --> A
+    MIG --> PG
+    A <-->|accounts, sessions, usage/outbox| PG
+    A -->|HTTPS usage events| MET
+    MET -->|provisioned usage invoices| STRIPE
+    A -->|Checkout / Portal API| STRIPE
+    STRIPE -->|signed webhook| A
     A --> K8S --> VS
     VS --> V0
     V0 <-->|Raft TLS| V1
@@ -284,6 +412,25 @@ disruption budget; the Skaffold production profile also removes the client
 image artifact. A reviewed external relying-party application and TLS
 Ingress/Gateway must be supplied by the operator.
 
+The same overlay selects PostgreSQL billing and adds the idempotent billing
+migration as a service init container. It intentionally leaves production plan
+IDs/URLs and every database, pepper, session, Stripe, and Metronome secret to
+the deployment secret system. Its checked-in
+`METRONOME_STRIPE_INVOICING_VERIFIED=false` prevents a production start from
+silently asserting that usage will be invoiced. The service NetworkPolicy
+permits Vault, cluster DNS, a same-namespace PostgreSQL pod labeled
+`spiral-safe.io/billing-database=allowed` on 5432, and a same-namespace HTTPS
+gateway labeled `spiral-safe.io/billing-gateway=allowed` on 443. It does not
+select Services, other namespaces, DNS names, managed databases, Stripe, or
+Metronome directly. Provider-specific egress and database routing must be
+supplied and reviewed for the target cluster.
+
+The checked-in init container and service currently consume the same
+`DATABASE_URL`. That is sufficient to run the migration but does not implement
+the recommended split between a schema-owner/migration role and a narrower
+runtime role. Separate those privileges before production rather than giving
+every service replica DDL authority.
+
 Raft membership is intentionally controlled. A new node needs the StatefulSet
 identity, trusted TLS material, KMS workload identity, network access, and
 quorum-approved join path. “Anyone can run a node” would let an attacker copy
@@ -303,17 +450,60 @@ models.
 The `services/nitro` adapter replaces the historical Nitriding dependency
 with [Amnesic Systems Veil](https://github.com/Amnesic-Systems/veil):
 
-- `veil-daemon` runs inside the enclave and exposes attested TLS on 8443;
-- Vault listens only on enclave loopback;
-- `veil-proxy` runs with host networking privileges on the EC2 parent;
-- `veil-verify` is exported as a relying-party tool.
+- one pinned Linux/amd64 container/EIF is used for either `bootstrap` or `join`;
+- a strict, short-lived schema-v1 manifest supplies node-specific identity,
+  operator-declared OCI digest plus exact EIF/source/Veil pins, unique Raft node ID, advertised addresses,
+  shared auto-unseal key ID, TLS paths, minimum voter count, and explicit names
+  for external storage/routing boundaries;
+- `veil-daemon` exposes attestation on 8443, while Vault uses separate mTLS API
+  and Raft-cluster endpoints on the Veil full-IP tunnel at 18200 and 18201;
+- `veil-verify` checks fresh nonce/PCR/TLS/source correspondence before an
+  external enrollment hook may return one short-lived bundle reference;
+- the membership check requires initialized, unsealed AWS-KMS-sealed Vault,
+  the exact node as a voter at its advertised cluster address, and healthy
+  Autopilot with failure tolerance derived from the odd minimum voter count.
 
-Veil is not a drop-in Nitriding binary. The image adapter builds the components
-and wires readiness/proxying, but persistence, initialization, recovery
-material delivery, KMS binding, independent attestation verification, and
-full EC2 lifecycle tests remain unresolved. Nitro Enclaves have no persistent
-storage, so the in-enclave Raft directory is disposable. The durable
-Kubernetes Raft topology is separate; the two modes are not yet combined.
+The renderer rejects unknown manifest fields, placeholders, unsafe or writable
+trust/key files, an admission lifetime longer than 30 minutes, missing mTLS or
+shared-seal requirements, wrong Veil tunnel binds, duplicate/missing leaders,
+and bootstrap/join field confusion. It generates Vault configuration; it does
+not make the manifest trustworthy or deliver it.
+
+The manifest's OCI `image.digest` is syntax/placeholder checked and useful for
+release inventory, but it is not derived from the running EIF or bound by the
+current admission script. The external delivery/release system must bind that
+value to signed provenance. Runtime admission currently rests on the separately
+obtained EIF SHA-384 plus Veil's PCR, nonce, TLS-certificate, and source checks;
+the local equality simulation is not proof of an OCI-to-EIF relationship.
+
+The one measured image intentionally uses a shared `.invalid` sentinel for the
+Veil listener name. `veil-verify` does not rely on ordinary CA/hostname trust:
+it hashes the leaf certificate presented by the operator-routed node and
+requires that hash inside fresh nonce-bound Nitro attestation before PCR
+comparison. The per-node `veilAddress` is therefore a routing address, not a
+generic PKI identity. Port 8443 must remain attestation-only; Vault clients use
+the independent operator-CA mTLS endpoint on 18200.
+
+This is a fail-closed admission scaffold, not a live quorum. Veil gives every
+parent/enclave pair the same `10.0.0.1/10.0.0.2` subnet and supplies no
+cross-host router. Nitro supplies no durable enclave block storage, and the
+Nitro CLI cannot inject the runtime manifest/TLS/KMS identity into an already
+attested EIF. A production voter is therefore blocked until all three exist
+and pass failure testing:
+
+1. a private per-node cross-host L4 overlay/forwarder for the unique Vault API
+   and Raft addresses;
+2. rollback-protected durable storage with Raft-compatible ordering, fsync,
+   fencing, snapshot, restore, crash, and per-node isolation semantics; and
+3. an attestation-bound delivery service for the manifest, TLS identities, and
+   narrowly scoped shared auto-unseal/KMS authorization.
+
+The local two-node simulation proves only that one image identity and KMS key
+can render distinct bootstrap/join node IDs, directories, and mTLS
+`retry_join`. The enrollment test uses a mock verifier, hook, Vault peer list,
+and Autopilot response. Neither is evidence of Nitro isolation, a durable
+voter, cross-host routing, or a live quorum. The Kubernetes Raft topology is a
+separate deployment mode.
 
 Veil is GPL-3.0-only. Distribution must preserve notices, source/build
 correspondence, and any applicable source-offer obligations, with legal review.

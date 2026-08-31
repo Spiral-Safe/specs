@@ -104,6 +104,26 @@ curl -i -X POST http://127.0.0.1:3000/check \
 The unauthenticated request should return 401; the authenticated lookup should
 reach Vault and return 404.
 
+### Local developer and admin consoles
+
+Compose also enables the account layer in explicit in-memory demo mode. Open:
+
+- <http://localhost:3000/developer/login> with
+  `developer@example.test` / `demo-developer-only`;
+- <http://localhost:3000/admin/login> with
+  `admin@example.test` / `demo-admin-only`.
+
+The developer can inspect fixture plan/usage data, create and revoke a scoped
+`ssk_test_...` key, and view the secret on its one-time response. The admin can
+inspect aggregate/account state and create another fixture account/developer.
+Do not paste even a production-like key into screenshots, traces, shell history,
+or support logs.
+
+This mode uses process memory, zero-price fixture plans, a known session secret,
+and known passwords. Stripe and Metronome are disabled, so Checkout/Portal and
+real invoicing are not exercised. Restarting the service loses the entire
+account/session/usage fixture. Production rejects memory mode and demo seeding.
+
 Stop the disposable stack:
 
 ```sh
@@ -193,6 +213,11 @@ Each sign operation should prompt WebAuthn. Batch signing intentionally uses one
 approval per transaction. Sign-and-send submits the already signed transaction
 through the RPC configured in the extension.
 
+The completion request repeats the operation selected at sign-in. Vault rejects
+any mismatch against its stored ceremony before signing, and the adapter also
+requires Vault to return that same operation. Successful transaction completion
+consumes one transaction unit; Solana and Ethereum message signatures do not.
+
 The API token and pending ceremony bindings disappear when extension session
 storage is cleared; re-enter the token and begin a fresh ceremony after a
 browser restart if required. Ordinary Manifest V3 worker suspension does not
@@ -203,7 +228,76 @@ neither the API token nor any credential embedded in a backend or RPC URL path;
 the public URLs are reduced to their origins. The full configured URLs remain
 inside the trusted worker for requests.
 
-## 5. Test the plugin, service, and SDK
+## 5. Generate annotated product recordings
+
+The recorder lives at `services/recording` and writes ignored native WebM,
+Playwright trace, screenshot, timeline, and root-manifest artifacts. Install
+both Node projects first, then test or capture all four flows:
+
+```sh
+cd services
+npm ci
+cd ../extension
+npm ci
+cd ../services
+npx playwright install chromium
+npm run recording:test
+npm run recording:all
+```
+
+The browser install is needed only when neither the pinned Playwright Chromium
+nor a supported local Chromium-family browser is already available; it requires
+network access. The extension flow is headed because ordinary headless Chromium
+does not load unpacked extensions.
+
+For the reproducible named walkthrough currently recorded in this workspace:
+
+```sh
+node recording/record.mjs --flow all --run-id product-walkthrough-final
+```
+
+The exact root artifact is
+`services/recording/output/product-walkthrough-final/manifest.json`. Under it,
+each
+of `extension-demo`, `standalone-wallet`, `developer-dashboard`, and
+`admin-dashboard` contains `recording.webm`, `trace.zip`, `timeline.json`, and
+numbered screenshots. Open a trace with, for example:
+
+```sh
+npx playwright show-trace \
+  recording/output/product-walkthrough-final/developer-dashboard/trace.zip
+```
+
+The extension flow loads the actual built unpacked extension in a persistent
+headed Chromium context and drives its real Wallet Standard demo. The wallet
+flow drives the actual standalone page. The dashboard flows compile the
+service, serve the real `/developer` and `/admin` routes, and log in through the
+real role/session forms. Every action receives a numbered title/description
+callout and target highlight before capture.
+
+Every capture is visibly labeled **FIXTURE MODE · SYNTHETIC LOCAL DATA**. A
+loopback fixture replaces Vault, Stripe, Metronome, cloud infrastructure,
+Solana RPC, production credentials, and physical passkeys. Dashboard capture
+uses the development in-memory billing seed and a fake Vault client that
+refuses wallet calls; Stripe/Metronome stay disabled. Extension/wallet capture
+uses a CDP virtual WebAuthn authenticator and a fake marker token. The developer
+flow fills but does not submit the key form, so no key plaintext enters an
+artifact.
+
+`bypassCSP` is enabled only in the capture context so the annotation overlay
+can be injected. Before doing that, the recorder asserts the real raw response
+CSP, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: same-origin`, and
+checks the authenticated document response again. This is a recorder safety
+check, not proof of browser CSP enforcement. Generated traces can contain DOM
+and source snapshots; review them before sharing. Native WebM output needs no
+FFmpeg conversion. See `services/recording/README.md` for individual flow
+commands and the selector contract.
+
+These recordings prove deterministic product wiring and presentation only.
+They do not prove a live Vault signing ceremony, Stripe charge, Metronome
+invoice, production database, physical authenticator, or capacity.
+
+## 6. Test the plugin, service, and SDK
 
 From `services`:
 
@@ -259,7 +353,7 @@ await client.create("alice", begin.ceremonyId, credential);
 The SDK deliberately leaves `navigator.credentials` and credential
 serialization to the relying-party page.
 
-## 6. Run bounded endpoint load tests
+## 7. Run bounded endpoint load tests
 
 The dependency-free suite covers both probes and every wallet route. It refuses
 remote targets, remote plaintext tokens, and mutating scenarios unless the
@@ -307,7 +401,7 @@ node --test load-test/suite.test.mjs
 Results are environment-specific smoke evidence, not capacity claims. Load only
 systems you own or are explicitly authorized to test.
 
-## 7. Render and run the local Kubernetes profile
+## 8. Render and run the local Kubernetes profile
 
 From `services`, inspect without mutating a cluster:
 
@@ -333,7 +427,7 @@ The service and local-demo Dockerfiles pin
 for their builder and runtime stages. Keep that digest review/refresh in the
 image release process rather than silently reverting to a mutable tag.
 
-## 8. Prepare the production Kubernetes profile
+## 9. Prepare the production Kubernetes profile
 
 The production overlay is intentionally incomplete until the operator supplies:
 
@@ -343,19 +437,115 @@ The production overlay is intentionally incomplete until the operator supplies:
    `vault-active`, `vault-internal`, and StatefulSet peer DNS names;
 4. a `vault-unseal` ConfigMap with `AWS_REGION` and
    `VAULT_AWSKMS_SEAL_KEY_ID`, plus a narrowly scoped workload identity;
-5. a `spiral-service-auth` Secret containing `API_TOKEN_HASHES`, generated
-   through the platform secret manager rather than committed plaintext. Each
-   digest must map to `{"tenant":"...","users":["..."]}` with a non-empty
-   username allowlist;
-6. replacement of every `REPLACE_ME.invalid` WebAuthn/CORS value;
-7. TLS ingress/Gateway and DNS resources;
-8. reviewed namespace/pod labels for ingress and operator NetworkPolicy access;
-9. backup, immutable audit export, metrics, alerts, and recovery ownership.
+5. production values for `BILLING_PLANS_JSON`, `CONSOLE_ORIGIN`, Checkout
+   success/cancel URLs, Portal return URL, and the reviewed Metronome ingest
+   endpoint/interval/batch size. Start from `services/.env.billing.example`;
+6. a `spiral-service-billing` Secret delivered by an external-secret/GitOps
+   mechanism, containing `DATABASE_URL`, independent random
+   `API_KEY_PEPPER` and `CONSOLE_SESSION_SECRET`, a least-privilege restricted
+   `STRIPE_API_KEY`, `STRIPE_WEBHOOK_SECRET`, and `METRONOME_API_TOKEN`;
+7. replacement of every `REPLACE_ME.invalid` WebAuthn/CORS/console value;
+8. exact database/provider egress: the checked-in policy permits only a
+   same-namespace pod labeled `spiral-safe.io/billing-database=allowed` on
+   5432 and a separate `spiral-safe.io/billing-gateway=allowed` pod on 443;
+9. TLS ingress/Gateway and DNS resources, including the Stripe webhook route;
+10. a controlled password-file Secret/mount and operator job for the provided
+    production administrator bootstrap, plus an external forced-change/MFA/
+    rotation procedure;
+11. reviewed namespace/pod labels for ingress and operator NetworkPolicy
+    access; and
+12. PostgreSQL/Vault backups, immutable audit export, metrics, alerts,
+    reconciliation, and recovery ownership.
 
-Do not add `VAULT_TOKEN` to the service Secret: production startup rejects
-every static Vault token and authenticates through `VAULT_K8S_ROLE`. The
-operator-only `VAULT_TOKEN` shown later is for an administrative CLI process,
-not an environment variable on the HTTP adapter.
+The production service input groups are:
+
+| Source | Values |
+| --- | --- |
+| Checked-in production posture | `SERVICE_DEV_MODE=false`, `BILLING_MODE=postgres`, `BILLING_DEMO_SEED=false`, `DATABASE_SSL=true`, Kubernetes Vault auth, and `METRONOME_STRIPE_INVOICING_VERIFIED=false` until deliberately patched after proof |
+| Operator ConfigMap values | exact CORS/WebAuthn/console origins; `BILLING_PLANS_JSON`; Stripe Checkout success/cancel, Portal return, and intent-version values; Metronome ingest URL/interval/batch; reservation/session TTLs; and the verified-invoicing gate |
+| External Secret values | `DATABASE_URL`, `API_KEY_PEPPER`, `CONSOLE_SESSION_SECRET`, restricted `STRIPE_API_KEY`, `STRIPE_WEBHOOK_SECRET`, and `METRONOME_API_TOKEN` |
+
+Keep the database, pepper, session, and provider secrets independent. Demo
+credentials are optional base-manifest inputs for local memory mode and must
+not be supplied to the production overlay.
+
+Do not create `spiral-service-auth` for production billing and do not add
+`API_TOKEN_HASHES`, `API_TOKENS`, or `API_TOKEN`: production account mode
+rejects static API credentials and uses developer-issued, database-backed keys.
+Do not add `VAULT_TOKEN` either; production rejects every static Vault token
+and authenticates through `VAULT_K8S_ROLE`. The operator-only `VAULT_TOKEN`
+shown later belongs to an administrative CLI process, not the HTTP adapter.
+
+The checked-in production ConfigMap deliberately sets
+`METRONOME_STRIPE_INVOICING_VERIFIED=false` and omits production plan/provider
+values. Supplying the secrets without completing those values does not produce
+a partially working biller: configuration fails closed at startup. Flip the
+global flag only after the environment-level provider integration and sandbox
+invoice are verified; wallet API calls still return 402 until each account's
+mapping attestation is recorded.
+
+### Database migration and privilege boundary
+
+The production patch adds a `billing-migrate` init container that runs
+`node dist/billing/migrate.js`. The migration is idempotent and takes a
+PostgreSQL advisory transaction lock, so concurrent replica init containers do
+not race. The equivalent operator command is:
+
+```sh
+cd services
+DATABASE_URL='postgresql://...' DATABASE_SSL=true npm run billing:migrate
+```
+
+The checked-in pod uses the same `DATABASE_URL` for migration and runtime.
+Before production, split schema-owner/migration credentials from the narrower
+service data role; otherwise every API replica retains unnecessary DDL
+authority. Configure enforced TLS/CA trust, HA, encrypted backups,
+point-in-time recovery, connection limits, restore drills, and migration
+rollback ownership. No real production PostgreSQL migration has been claimed.
+
+After the schema exists, create or rotate the first account-independent admin
+from a protected operator shell or one-shot job:
+
+```sh
+DATABASE_URL='postgresql://...' DATABASE_SSL=true \
+  npm run billing:bootstrap-admin -- \
+  --email admin@example.com \
+  --password-file /run/secrets/spiral_admin_password
+```
+
+The CLI refuses `--password`, symlinks, non-regular files, and files larger
+than 4 KiB; it hashes the password with the console scrypt parameters and logs
+no secret. It can only insert/update an account-independent admin row and never
+promotes a developer. Use operator database credentials, mount the file from a
+secret manager, and delete or unmount it immediately. This bootstrap does not
+provide SSO, MFA, forced first-login change, password reset, or recovery.
+
+### Stripe and Metronome provisioning gate
+
+For every production plan, create a distinct Stripe Product and base Price and
+distinct Metronome Product/rate-card IDs. Test the Stripe restricted-key
+permissions and configure `POST /billing/stripe/webhook` with the exact signing
+secret. Checkout intentionally does not choose payment methods or automatic
+tax; tax registrations, product codes, evidence, provider, and failure alerts
+must be decided and tested before paid launch.
+
+Then, for every account:
+
+1. let the verified Stripe webhook record the Stripe customer/subscription;
+2. create the Metronome customer using the account's exact ingest alias;
+3. attach the intended rate-card contract and select the same Stripe customer
+   as its billing-provider configuration;
+4. map invoice-line products, ingest sandbox events, finalize an invoice, and
+   verify collection/error alerts; and
+5. only then use the admin account view to record the per-account attestation.
+
+The store atomically compares and snapshots the submitted Stripe customer,
+Metronome ingest alias, visible local plan, and Metronome rate card.
+Customer-alias/customer/plan/rate-card changes and terminal subscription
+clearing make it non-current and restore the 402 gate. It is still an operator
+assertion, not a live Metronome query. Reconcile it continuously and fail closed
+if provider state drifts. Current repository verification includes mocked
+integrations only, not a live Stripe charge or Metronome-created invoice.
 
 The production overlay explicitly deletes the local `spiral-client`
 Deployment, Service, and disruption budget, and the Skaffold production profile
@@ -404,7 +594,11 @@ and network policy. Do not allow anonymous node joins.
 Schedule Vault Raft snapshots to encrypted off-cluster storage and perform a
 documented restore drill before calling the deployment durable. Test quorum
 loss, pod/node/zone failure, KMS outage/recovery, certificate rotation, service
-token rotation, rolling upgrades, audit-disk exhaustion, and leader failover.
+token rotation, API-key pepper/key reissue, console-session-secret rotation,
+provider-key/webhook-secret rotation, rolling upgrades, audit-disk exhaustion,
+and leader failover. A pepper change also changes the opaque active-wallet
+metering ID, so coordinate it with the billing period and reconciliation rather
+than rotating it blindly.
 
 Primary references:
 
@@ -413,52 +607,129 @@ Primary references:
 - [Vault HA with Raft and TLS](https://developer.hashicorp.com/vault/docs/deploy/kubernetes/helm/examples/ha-tls)
 - [Skaffold configuration](https://skaffold.dev/docs/references/yaml/)
 
-## 9. Build the Veil adapter
+## 10. Build the Veil adapter
 
-The safe workstation boundary is the ordinary container image and exported
-tools:
+The safe workstation boundary is the ordinary Linux/amd64 image, exported
+tools, strict manifest tests, and configuration-only topology simulation:
 
 ```sh
 cd services/nitro
-VEIL_FQDN=vault.example.com \
-WEBAUTHN_RP_ID=wallet.example.com \
-WEBAUTHN_RP_ORIGINS=https://wallet.example.com \
 make image
 make tools
+make test
+make simulate
 ```
 
-These values are measured image inputs. Use the intended immutable release
-values before an EIF build. The Dockerfile verifies pinned Veil source, embeds
-license files, builds the local Spiral Safe plugin, and includes
-`veil-daemon`; `make tools` exports `veil-proxy` and `veil-verify`.
+The Dockerfile verifies pinned Veil source, embeds license files, builds the
+current Spiral Safe plugin and strict `spiral-node-config` renderer, and
+includes `veil-daemon`. `make tools` exports `veil-proxy`, `veil-verify`, and
+the renderer. `make test` runs renderer tests, shell syntax/ShellCheck, the
+same-image simulation, and a mocked enrollment/membership test.
+
+The checked-in image deliberately uses the shared
+`spiral-safe-attestation.invalid` Veil FQDN. Do not replace it with per-node
+image builds: official `veil-verify`
+does not trust ordinary CA/hostname validation for this attestation endpoint.
+It hashes the leaf certificate actually presented by the routed node and
+requires that hash in a fresh nonce-bound Nitro attestation before PCR
+comparison. Each manifest's `veilAddress` is therefore only the operator's
+routable endpoint to that node. Port 8443 is attestation-only; never point a
+generic PKI client or the Vault API at it.
+
+Copy `same-image-manifest.template.json` to a protected path outside the source
+tree and fill every placeholder. Bootstrap and joiner manifests must carry the
+same operator-declared image digest, EIF SHA-384, source/Veil revisions, and AWS
+KMS key ID, but distinct node IDs and durable storage. The renderer only checks
+the OCI digest's syntax and equality in the simulation; signed release
+provenance must bind it to the EIF before it can be an admission claim. A
+bootstrap manifest has no leaders or join-client TLS; a joiner has at least one
+HTTPS leader and mTLS join files.
+Every manifest needs a window of at most 30 minutes, odd minimum voter count of
+at least three, exact 18200/18201 tunnel binds, operator mTLS material paths,
+WebAuthn RP values, and explicit external storage/route implementation names.
+
+Validate the schema before a hardware launch:
+
+```sh
+NODE_MANIFEST=/secure/node-a.json CHECK_FILES=false make validate-config
+```
+
+`CHECK_FILES=false` is only for pre-provisioning schema review. Admission must
+later validate the real trust/key files and their restrictive permissions.
 
 On suitable Linux with Nitro CLI:
 
 ```sh
-make eif
+make image eif tools
 ```
 
-On a dedicated enclave-enabled EC2 parent, after reviewing the script and
-networking:
+On a dedicated enclave-enabled EC2 parent, after providing the private
+cross-host L4 route and reviewing privileged TUN/VSOCK networking:
 
 ```sh
-make run
+NODE_MANIFEST=/secure/node-a.json make run
 ```
 
-The run path starts the privileged Veil host proxy and one named enclave. It
-does not use debug mode, attach a console, terminate other enclaves, or stop the
-new enclave when the proxy exits. Manage it explicitly by name.
+The run path verifies the manifest/EIF hash, starts the privileged Veil host
+proxy, and launches one manifest-named enclave. It does not use debug mode,
+attach a console, terminate other enclaves, or stop the new enclave when the
+proxy exits. Manage it explicitly by name. Vault waits inside for a manifest;
+the repository intentionally supplies no generic upload endpoint.
 
-Before accepting any real request, implement and test:
+From a clean checkout at the exact manifest source revision, perform the Veil
+source/PCR/nonce/TLS proof before any identity is released:
 
-- durable, attested external persistence;
-- nonce-bound independent verification with `veil-verify`;
-- PCR/application-hash release policy;
-- attestation-aware TLS pinning and Vault initialization;
-- recovery-material delivery that the EC2 parent cannot observe;
-- attestation-bound KMS/workload identity;
-- plugin registration without embedded privileged credentials;
-- full restart, upgrade, backup, restore, and disaster-recovery behavior.
+```sh
+NODE_MANIFEST=/secure/node-a.json \
+SOURCE_DIR=/secure/clean-services-checkout \
+make verify-admission
+```
+
+After that succeeds, an operator-owned admission service may return one
+short-lived, attestation-bound bundle reference:
+
+```sh
+SPIRAL_ENROLLMENT_HOOK=/opt/spiral/bin/issue-enrollment \
+NODE_MANIFEST=/secure/node-a.json \
+SOURCE_DIR=/secure/clean-services-checkout \
+make admit
+```
+
+The hook must be an absolute executable and its stdout must be exactly one
+bounded `file:/...` or `secret-ref://...` reference. The repository does not
+implement the receiver that resolves that reference inside the EIF or delivers
+the manifest, TLS keys, and KMS identity after attestation. Until such a channel
+exists, Vault cannot safely proceed past its wait boundary.
+
+After an externally initialized/unsealed joiner has converged, use a short-lived
+operator token and separate client certificate to prove exact voter identity,
+minimum quorum, and healthy Autopilot:
+
+```sh
+VAULT_CACERT=/secure/operator-ca.crt \
+VAULT_CLIENT_CERT=/secure/operator.crt \
+VAULT_CLIENT_KEY=/secure/operator.key \
+VAULT_TLS_SERVER_NAME=vault.internal \
+VAULT_TOKEN=REDACTED \
+NODE_MANIFEST=/secure/node-a.json \
+make check-membership
+```
+
+Before accepting any real request, implement and test all three missing runtime
+boundaries:
+
+- a private per-node L4 forwarder/overlay from unique advertised API and Raft
+  addresses to each host's reused `10.0.0.2` tunnel endpoint;
+- durable, encrypted, rollback-protected, fenced storage with Raft-compatible
+  ordering/fsync/crash semantics and tested snapshot/restore; and
+- the attestation-bound manifest/TLS/shared-KMS identity delivery service,
+  including recovery material and plugin bootstrap without parent-visible
+  privileged credentials.
+
+Then run a real three-node bootstrap/join/failover/removal/replacement cycle,
+KMS outage/recovery, rollback attempt, backup/restore, altered-image rejection,
+and nonce-bound independent attestation on enclave-enabled EC2. Neither
+`make simulate` nor the mocked enrollment test is a live Vault quorum.
 
 Follow the [Veil repository](https://github.com/Amnesic-Systems/veil), its
 [examples](https://github.com/Amnesic-Systems/veil-examples), and the
@@ -466,7 +737,7 @@ Follow the [Veil repository](https://github.com/Amnesic-Systems/veil), its
 Review GPL-3.0 corresponding-source obligations before distributing a Veil
 binary or combined image.
 
-## 10. Other repositories
+## 11. Other repositories
 
 Website:
 
@@ -501,6 +772,22 @@ maintenance workflow.
 - **403 `user_forbidden`:** add the exact username to that token's production
   `users` mapping or issue a different authorized credential. The request is
   rejected before Vault, so changing wallet storage cannot fix it.
+- **403 `scope_forbidden`:** issue a key with the route's required scope; the
+  client cannot elevate the stored key record.
+- **402 `payment_required`:** the stored account is absent/inactive; reconcile
+  the verified Stripe subscription webhook state before retrying.
+- **402 `billing_provisioning_required`:** the Metronome runtime is enabled but
+  the account's exact Stripe-provider mapping has not been operator-attested.
+  Provision and sandbox-test it; do not bypass the gate.
+- **429 `quota_exceeded`:** the plan's active-wallet or transaction limit is
+  exhausted for the current stored billing period. Do not delete usage rows to
+  evade accounting.
+- **Console login loops or 403 form submission:** use the exact
+  `CONSOLE_ORIGIN`; native forms require the same Origin plus the session CSRF
+  token, and production cookies require HTTPS.
+- **Billing pod will not start:** inspect missing PostgreSQL/plan/Stripe/
+  Metronome configuration, the intentionally false global invoicing gate,
+  migration permissions, database TLS, and NetworkPolicy/egress gateway.
 - **409 after `/init`:** the wallet is already registered or registration is
   incomplete; choose the intended recovery/re-registration action.
 - **Expired/used ceremony:** begin a new ceremony; completion is deliberately
@@ -508,6 +795,7 @@ maintenance workflow.
 - **Extension not discovered:** build the adapter and extension, reload the
   unpacked extension, then refresh the dApp.
 - **`/readyz` fails:** check Vault seal/leader state, service-account
-  authentication, CA configuration, and policy.
+  authentication, CA configuration and policy, plus PostgreSQL readiness when
+  billing is enabled.
 - **Raft pod will not join:** verify peer DNS/SANs, CA/client certificate, KMS
   identity, NetworkPolicy, initialization state, and existing quorum.

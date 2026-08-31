@@ -2,131 +2,139 @@
 
 Verification date: **2026-08-30**.
 
-This record distinguishes automated checks that actually ran from source review
-and from environment-dependent acceptance work. A pass means only what the
-listed command can establish.
+This record separates commands that actually ran, source/configuration review,
+fixture demonstrations, and environment-dependent work that has not run. A
+pass establishes only the property named in its row. The account/billing,
+recording, deployment, and same-image Nitro changes are still uncommitted, so
+results apply to this workspace rather than remote `main`.
 
 ## Evidence levels
 
-- **Executed:** command completed against the current workspace.
-- **Reviewed/rendered:** code or generated configuration was inspected, but the
+- **Executed:** the command completed against the identified source state.
+- **Fixture capture:** actual product code ran, but named external/security
+  boundaries were deterministic substitutes.
+- **Reviewed/rendered:** source or generated configuration was inspected; the
   target runtime was not created.
-- **Not run:** no claim is made for the behavior.
-
-The workspace contains uncommitted changes across repositories. Results apply
-to this local tree, not to the remote `main` branches until the changes are
-committed.
+- **Not run:** no behavior claim is made.
 
 ## Executed automated checks
 
-The remediated Go module declares Go 1.25.7. Container builders use
-`golang:1.26@sha256:e30143be198ab04cf7ba25fba83ab3a692ca584c994aad0bf131fa0eb32dd8c1`;
-the direct Vault API/SDK dependencies are v1.23.0 and v0.25.1.
-
-| Area | Command/check | Result and meaning |
+| Area | Command/check | Result and scope |
 | --- | --- | --- |
-| Extension | `npm test`; `npm run build` | **Pass: 15/15 and production bundle built.** Covers protocol codecs, settings/origin validation, bearer isolation, redaction of path-embedded credentials from page-facing backend/RPC URLs, authoritative ceremony IDs, expiry/replay/cross-tab rejection, browser-session ceremony persistence across controller restart, backend registration/signing requests, RPC submission, provider events, every advertised signing method, SIWS binding, and Wallet Standard routing with test doubles. Webpack reports only its non-blocking size/performance warning for the 462 KiB `inject.js`; optimize that bundle before store release. The checks do not install Chrome or use a physical authenticator. |
-| Wallet adapter | `npm test` | **Pass: 2/2.** Builds CommonJS/ESM/types and verifies feature registration/routing. It does not validate a live backend. |
-| SDK | `npm test` | **Pass: 5/5.** Builds the bundle and verifies bearer headers, identity/ceremony bodies, all five routes, URL constraints, binary payload conversion, and structured errors against mocks. |
-| Service adapter/config/Vault client | `npm test` | **Pass: 12/12.** Covers public health/readiness, bearer rejection, server-side tenant injection, production username allowlists and pre-Vault 403 rejection, allowed-origin CORS, signing payload/legacy alias forwarding, chain/credential validation, missing-registration and Vault error mapping, rejection of every static production Vault token, local config constraints, Kubernetes-token lease caching, and one retry after a Vault 403. The process-local rate limiter still needs dedicated behavior tests. |
-| Vault plugin and chain signers | pinned Go 1.26 container, `go test ./...` against the exact final source | **Pass.** The plugin package passed; the command package has no tests. Coverage is detailed below. This is a software-authenticator/framework test, not a platform-authenticator or live Vault process. |
-| Go vulnerability scan | same pinned container, `go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...` against the current database | **No vulnerabilities found: 0 affected and 0 in imported packages.** One required module contains a vulnerable symbol that the application does not call. This path-sensitive result must be rerun when code or dependencies change. |
-| Load harness safety/parser | `npm run load:test` / `node --test load-test/suite.test.mjs` | **Pass: 7/7.** Confirms all endpoint scenarios, mutation opt-in, loopback/remote safeguards, token requirement, URL rejection, smoke bounds, and expected-status overrides. For `/create`, `/signin`, and `/complete`, the harness deliberately measures only invalid or missing-user paths; it does not establish successful WebAuthn/signing capacity. |
-| npm dependency audits | full `npm audit --json` in `services`, `extension`, `wallet-adapter`, and `sdk` | **Pass: zero known advisories in all four full dependency trees** (195, 181, 124, and 114 audited dependencies respectively). This is a dated registry/scanner result, not a security audit. Narrow overrides remain subject to compatibility testing and future removal. |
-| Skaffold image build | exact-final-source `skaffold build --cache-artifacts=false --file-output=...` | **Pass:** plugin `sha256:e75c47eaac944816d99bcebd16cba5648dd571803622dda7d65b6e13a24f5168`, service `sha256:8b33ac9525d2105767273dfdb97db1293a48c45f9e77e9ccd9e484a1e40c8691`, and local client `sha256:21ccdb6b7a66e917ade288f86f693bbfa956d3698064d59a8f9817655dd8261c`. Images were built, not pushed or deployed. |
-| Skaffold/Kubernetes configuration | local/production diagnose, direct Kustomize and offline Skaffold render, kubeconform v0.7.0 strict | **Pass:** local 12/12 and production 19/19 resources, with zero invalid, errors, or skipped. Production resolves exactly two artifacts (plugin/service), no client and no port forwarding; local resolves all three. No objects were applied to a cluster. |
-| Deployment scripts/config | `bash -n`, ShellCheck, Make dry-runs, diff checks, and production Vault HCL parse | **Pass.** Vault parsed the production configuration through to the expected unavailable external AWS-KMS boundary. No privileged, cluster, KMS, or other cloud operation was invoked. |
-| Local service demo browser smoke | self-contained client opened at `http://127.0.0.1:9082` | **Pass for the static/browser boundary.** The UI rendered with zero browser logs; `?api=https://evil.example` was rejected; clicking Register reached the fetch path, confirming the bundled `browser.js`/`index.js` wiring. No backend success response, extension, or real authenticator was involved. |
-| Exact-source Compose/plugin/API smoke | isolated loopback Compose stack with Vault 1.21.4, then the all-route suite | **Pass, then cleanly removed.** Vault catalogued and enabled the Spiral Safe plugin. The endpoint matrix completed all 8 scenarios with 0 unexpected: health 200, readiness 200, unauthenticated check 401, missing check 404, init 200, and negative missing-state create/signin/complete 404. A second same-user init returned the same address with a distinct 43-character ceremony ID, exercising the framework update route; incomplete signin returned the expected `wallet_not_found` 404. This is one bounded request per path class, not successful-ceremony capacity. Containers, volumes, networks, and all task temporary artifacts were removed. |
-| Veil image | exact-final-source ARM64 `docker build -f nitro/Dockerfile -t spiral-safe/veil:validation .` plus layout/metadata smoke | **Pass:** image `sha256:ce474d54d2d7f520ef9e15a498a62865bb0271a26deefcc3465d7c11c76ff7d4`, with pinned Veil `2b8c06ca651e09b21832f6fc4ae2605371386f76`, Go 1.26, Vault 1.21.4, executable layout, source label, and license files. No EIF or enclave was started. |
-| Veil host/verifier tools | `docker buildx build --platform linux/arm64 --target veil-tools --output type=local` | **Pass.** Exported executable, stripped, static ARM64 ELF `veil-proxy`/`veil-verify` and the GPL license. The privileged proxy was not run. |
+| Service TypeScript | `npm run build`; `npm run lint`; `TEST_DATABASE_URL=<ephemeral-postgresql-url> npm test` against the exact final source | **Pass: build and formatting; 46 tests passed, 0 failed, 0 skipped.** Covers adapter/config/Vault-client behavior plus API-key hashing/revocation, scrypt, admin bootstrap input safety, session/role/Origin/CSRF behavior, console redaction and atomic full-tuple provider-mapping confirmation, current-period analytics, memory-store quotas/idempotency/expiry, transaction-only completion metering, trusted Vault-operation reconciliation, commit ambiguity, provider-period fail-closed behavior, mapping invalidation, Stripe Checkout/Portal/webhook mapping, Metronome delivery/retry/dead-letter logic, account-aware wallet calls, and the real PostgreSQL integration. The PostgreSQL run caught and validated fixes for explicit reservation-expiry timestamp/integer casts and the daily-usage grouping alias. It is one test database, not HA/failover/PITR evidence; provider calls remain mocked. |
+| Service dependency audit | full and runtime-only `npm audit` after the final billing dependency graph | **Pass: zero known advisories.** This is a dated registry/scanner result, not a security audit. |
+| Extension | `npm test`; `npm run build` | **Pass: 15/15 and production bundle built.** Covers bridge/config/origin rules, secret and URL-path redaction, ceremony binding/persistence/replay/cross-tab rejection, backend/RPC routing, provider events, advertised Wallet Standard methods, and SIWS with test doubles. The build retains a non-blocking size warning for the large injected bundle. |
+| Wallet adapter | `npm test` | **Pass: 2/2.** Builds CommonJS/ESM/types and verifies feature registration/routing with test doubles. |
+| SDK | `npm test` | **Pass: 5/5.** Builds and verifies bearer headers, identities/ceremonies, all five wallet routes, URL constraints, payload conversion, and structured errors against mocks. |
+| Other npm dependency audits | full `npm audit` in extension, wallet-adapter, and SDK after their final dependency graphs | **Pass: zero known advisories in each recorded run.** No recording dependency was added to these trees. |
+| Vault plugin and chain signers | pinned Go 1.26 container, `go test ./...` | **Pass.** Covers the cryptographic software-authenticator/framework lifecycle and chain boundaries summarized below. It is not a physical-authenticator or live Vault-process test. |
+| Go vulnerability scan | pinned Go container, `govulncheck@v1.7.0 ./...` | **No reachable or imported-package vulnerability in the recorded current core graph.** One required module contained an uncalled vulnerable symbol. Rerun when Go code or dependencies change. |
+| Load harness safety/parser | `npm run load:test` | **Pass: 9/9.** Covers endpoint scenario selection, mutation/remote-target/token safeguards, status parsing, exact-Origin rejection, manual redirect observation, and per-request ceremony-ID uniqueness. It does not run successful WebAuthn ceremonies or establish capacity. |
+| Live all-route fixture load | disposable Compose stack; `node load-test/suite.mjs --scenario all --allow-mutations --requests 10 --concurrency 2 --chain ethereum` with only local credentials | **Pass: 260 requests across 26 method/path scenarios, 0 unexpected statuses or client errors.** Earlier runs exposed and led to fixes for automatic redirect following, shared probe ceremony IDs, and treating the console's correct 403 exact-Origin rejection as an expected login-probe outcome; the final repeated run passed. Wallet mutation cases use successful `/init` plus negative missing-wallet/placeholder-credential paths, so this is endpoint/control-plane smoke evidence, not successful signing throughput or production capacity. Containers, network, and uniquely named images were removed afterward. |
+| Recording runner | `npm run recording:test` with permission to bind its loopback listener | **Pass: 8/8.** Verifies manifest/selector/fixture/output safety contracts, collision-aware annotation placement, first-presented-frame timeline timing, and the no-video path; it does not launch the four product flows. |
+| Annotated product capture | `node recording/record.mjs --flow all --run-id product-walkthrough-final` against the exact final source | **Fixture capture pass for all four flows with zero recorded warnings:** four native WebM files, four trace ZIPs, 20 annotated PNGs, and four five-step timelines under `services/recording/output/product-walkthrough-final/`. It loaded the actual unpacked extension and its Wallet Standard demo, the actual `services/public` page, and the actual compiled `/developer` and `/admin` console routes. |
+| Nitro manifest renderer | pinned Go 1.26, `go test ./...` in `services/nitro/config-renderer` | **Pass.** Includes strict JSON/schema, placeholder/expiry/mode/bind/leader checks, manifest symlink/mutability rejection, trust-file group/other-write rejection, private-key permissions, and bootstrap/join `retry_join` rendering. |
+| Nitro scripts and topology | ShellCheck 0.11, `bash -n`, `make -C nitro simulate`, `tests/enroll-node-test.sh` | **Pass.** Simulation proves consistent declared image/KMS inputs, a shared measured attestation sentinel, distinct node IDs/directories/routed addresses, and join mTLS configuration. It does not bind the declared OCI digest to an EIF; that needs signed external release provenance. The mocked admission test proves Veil verification precedes the hook, failure blocks it, only a short-lived reference is emitted, and unhealthy/insufficient Autopilot membership is rejected. It is not a live quorum. |
+| Same-image ordinary container | exact-source Linux/amd64 OCI build and inspection | **Pass:** manifest `sha256:4b149d3ac8ffbdc41d9bbe9d5a3f7e2b5677d552583d2337c7e45d2d24beb0ce`, config `sha256:b929465267ba089060a51403bef822cc4ca196fe97d8ba1b8192774d1ced2bda`. Labels/environment contain the shared `spiral-safe-attestation.invalid` verifier-only sentinel, and the build statically checks pinned Veil's leaf-certificate-hash/attestation binding. No EIF was built or launched; an OCI archive checksum is intentionally not treated as identity because its creation annotation is not stable. |
+
+### Recording trust boundary
+
+Every captured page is labeled **FIXTURE MODE · SYNTHETIC LOCAL DATA**. The
+extension/wallet flows use a loopback fake signing/RPC backend, fake token, and
+CDP virtual WebAuthn authenticator. Dashboard flows use the actual compiled
+routes and session forms but an in-memory demo account store, fake Vault client,
+and disabled Stripe/Metronome. The key form is not submitted. A raw preflight
+and authenticated response assert CSP/nosniff/same-origin-referrer headers
+before the capture-only CSP bypass injects annotations. None of this proves a
+physical authenticator, production CSP enforcement, real signing backend,
+database, provider, billing, or capacity.
+
+## Current deployment/configuration checks
+
+| Area | Command/check | Result and scope |
+| --- | --- | --- |
+| Kustomize/Skaffold | direct Kustomize and offline Skaffold local/production render; Skaffold diagnose | **Pass:** local 13 resources and production 19; render methods agree and diagnose succeeds. No resources were applied to a cluster. |
+| Compose configuration/runtime | Compose configuration plus isolated build/boot on alternate loopback ports | **Pass for the local fixture:** `/healthz` and `/readyz` succeeded, client returned 200, and developer/admin login redirects resolved to 200. Stack and temporary image were removed. This did not complete WebAuthn signing or external billing. |
+| Production fail-closed gates | migration/process and configuration fixtures | **Pass:** migration entrypoint runs as UID 10001 with a read-only root filesystem and fails without `DATABASE_URL`; configuration rejects missing plans, missing Stripe plan IDs, and unverified Metronome-to-Stripe invoicing. |
+| Production egress shape | rendered NetworkPolicies | **Pass for manifest intent:** same-namespace PostgreSQL port 5432 and HTTPS gateway port 443 use separate labels. External database/provider routing remains operator-owned and was not exercised. |
 
 ## Executed Go lifecycle coverage
 
-The final-source Go suite contains:
+The recorded final core Go suite contains:
 
 - tenant and chain storage isolation;
-- deterministic, tenant/user/chain-scoped WebAuthn user handles that remain
-  within the 64-byte protocol limit;
+- deterministic tenant/user/chain WebAuthn user handles within the protocol
+  limit;
 - Solana message and legacy-transaction verification, wrong-signer rejection,
   malformed/truncated parser containment, and versioned-transaction rejection;
-- Ethereum key generation, EIP-55 address derivation, EIP-191 signature
-  generation, address recovery, recovery-ID bounds, and transaction rejection;
-- a complete cryptographic software-authenticator registration and assertion
-  lifecycle routed through Vault `Backend.HandleRequest`, including logical
-  create/update route coverage;
-- required WebAuthn user-verification rejection, one-time ceremony replay
-  rejection, sign-counter persistence, and permanent clone-warning disablement
-  after a nonzero counter regression.
+- Ethereum EIP-55 key/address derivation, EIP-191 signing/recovery, recovery-ID
+  bounds, and transaction rejection;
+- trusted completion-operation recovery and mismatch rejection before signing;
+- complete P-256 software-authenticator registration/assertion through Vault
+  `Backend.HandleRequest`, including create/update routing;
+- required user-verification rejection, one-time ceremony replay rejection,
+  sign-counter persistence, and permanent clone-warning disablement after a
+  nonzero counter regression.
 
-The service and extension suites jointly test the contract boundary: the
-server—not the client—injects the tenant, and the backend-issued ceremony ID is
-the same ID the extension binds to the requesting tab/frame/origin.
+These properties do not prove every browser/authenticator or distributed
+failure mode.
 
-These are necessary unit/integration properties. They do not prove that every
-browser/authenticator or distributed failure mode works.
+## Reviewed source/configuration boundaries
 
-## Reviewed or rendered, not deployed
-
-| Area | What was inspected | What remains unproven |
+| Area | Present in source | Still unproven |
 | --- | --- | --- |
-| Production Vault Raft/API | Three-node StatefulSet, headless/active services, two API replicas, TLS configuration, retained data/audit PVCs, KMS seal inputs, anti-affinity, PDB, RBAC, Kubernetes auth, NetworkPolicies, username-scoped API principal inputs, and deletion of all local client/demo resources | initialization, auto-unseal, TLS SAN correctness, real joins/elections, leader routing, snapshots/restores, upgrades, quorum loss, KMS outage, audit export, and an external relying-party/ingress |
-| Local Skaffold | Default dev overlay and port-forward configuration | successful apply on kind/minikube/Docker Desktop and live rebuild loop |
-| Extension runtime | Manifest, privileged/background/content/page boundaries, popup configuration, demo source, automated mocks, and controller recreation against a shared session-store test double | unpacked Chrome installation, optional-host permission UX, an actual MV3 suspension/resume cycle during WebAuthn, and live Wallet Standard dApp interoperability |
-| Local service demo | Self-contained bundle inputs, text-only DOM insertion, CSP/security headers, same-host loopback API validation, production deletion patch, and browser smoke | a platform-authenticator ceremony and cross-browser matrix |
-| Container inputs | Pinned Node 22, Go 1.26, Vault 1.21.4, and Veil source references plus exact built digests | registry provenance, SBOMs, signatures, and production runtime behavior |
-| Veil adapter | Built daemon/proxy/verify roles, pinned source, loopback Vault config, readiness wiring, non-debug named launch, and licenses | EIF behavior, attestation document validation, persistent state, secure bootstrap, KMS binding, EC2 networking, and recovery |
+| Account API | PostgreSQL store, one-time-reveal hashed scoped keys, sessions/roles, admin bootstrap, quotas, period checks, durable usage/outbox/webhook claims | real PostgreSQL migration/HA/TLS/PITR/restore, split migration/runtime roles, multi-replica contention, SSO/MFA/password recovery |
+| Stripe/Metronome | hosted Checkout/Portal helpers, raw signature verification, current-Price plan mapping, provider-state mapping invalidation, asynchronous stable outbox events | live restricted-key permissions, Checkout, webhook delivery, Metronome customer/contract/provider mapping, invoice, collection, tax, reconciliation and alerts |
+| Production Kubernetes | three-node Vault Raft intent, two API replicas, migration init container, external billing inputs, client removal, and restrictive egress design | real apply, TLS/KMS/storage/ingress/database/provider routing, joins/failover/restore/upgrades |
+| Extension runtime | actual unpacked extension ran against the fixture recorder | real backend + physical authenticator, optional-host permission UX, true MV3 suspension during a passkey prompt, and live third-party dApp interoperability |
+| Veil admission | same-image strict renderer, official-verifier wrapper, enrollment hook boundary, membership checks, ordinary OCI image and tests | EIF, EC2/NSM proof, cross-host L4, durable anti-rollback storage, attestation-bound bundle/TLS/KMS delivery, initialization and live quorum |
 
 ## Explicitly not run
 
 The following remain acceptance requirements, not completed verification:
 
-- real platform/roaming-authenticator `/init → /create → /signin → /complete`
-  on Chrome, Safari, Firefox, and Edge targets;
-- an unpacked-extension end-to-end sign transaction/message/batch/send/SIWS
-  session with the real backend and authenticator;
-- high-volume or sustained load, soak, fault-injection, and multi-replica
-  ceremony tests;
-- successful `/create → /signin → /complete` load or capacity testing; the
-  endpoint harness uses negative/missing-user cases for those three routes;
-- Solana devnet broadcast through the extension with a funded disposable key;
-- a real Kubernetes apply, IRSA/workload identity, ingress, public TLS/DNS,
-  StorageClass, KMS auto-unseal, Vault initialization/unseal, Raft failover,
-  node replacement, snapshot/restore, upgrade, backup, and disaster-recovery
-  exercise;
-- production OIDC/session/token issuance and revocation;
-- EIF creation or launch/termination on an enclave-enabled EC2 parent; no
-  enclave lifecycle command was run;
-- Veil/NSM nonce-bound independent attestation, PCR/application-hash comparison,
-  altered-image rejection, attestation-aware Vault bootstrap, persistent state,
-  or KMS policy enforcement;
-- penetration testing, external cryptographic/security audit, SBOM/provenance
-  verification, and license counsel review.
+- a physical platform/roaming-authenticator
+  `/init → /create → /signin → /complete` matrix on supported Chrome, Safari,
+  Firefox, and Edge targets;
+- an unpacked-extension session with the real Vault backend and physical
+  authenticator covering transaction/message/batch/send/SIWS;
+- successful ceremony/signing capacity, sustained load, soak, fault injection,
+  and multi-replica contention. The endpoint load harness uses negative or
+  missing-user `/create`, `/signin`, and `/complete` paths;
+- a funded Solana devnet broadcast through the extension;
+- a real production PostgreSQL migration, narrowed runtime role, HA/failover,
+  PITR/restore, retention, and secret rotation exercise;
+- live Stripe Checkout/Portal/webhook, a Metronome ingest-to-Stripe invoice,
+  charge/collection/refund, mapping reconciliation, tax flow, or provider
+  outage/recovery;
+- a real Kubernetes apply, registry push, workload identity, public TLS/DNS,
+  ingress, StorageClass, KMS auto-unseal, Vault initialization, Raft failover,
+  snapshots/restores, upgrades, backup, and disaster recovery;
+- EIF creation or launch/termination, independent nonce/PCR/TLS attestation on
+  enclave-enabled EC2, cross-host routing, durable enclave storage,
+  attestation-bound runtime delivery/KMS identity, or a live Vault quorum;
+- penetration testing, external custody/billing/security audit, SBOM/provenance
+  verification, and license/tax counsel review.
 
 ## Non-runtime repository baseline
 
-Earlier workspace checks, unaffected by the signing changes, established:
+Earlier onboarding checks established that the Hugo website builds with its
+pinned theme but has a missing visible `/showcase` target, and that the token
+list's build/main validator pass while partner-refresh tooling needs separate
+data-maintenance review. These are inventory facts, not custody-runtime
+evidence.
 
-- the Hugo website can initialize its pinned Terminal-theme submodule and build
-  and serve its primary pages; its visible `/showcase` target was missing;
-- the token-list TypeScript build and main PR validator pass, while its partner
-  snapshots/tooling need separate data-maintenance review;
-- all eight repositories are full clones; `services` is the only repository
-  with an additional remote branch and the organization’s only Git tag.
+## Closing the gaps
 
-These are inventory/onboarding facts, not evidence for the custody runtime.
-
-## How to close the remaining evidence gaps
-
-1. Run the Go, Node, Compose, safe load, and browser manual steps from
-   [RUNBOOK.md](RUNBOOK.md) from a clean checkout in CI and retain logs plus
-   artifact hashes.
-2. Add an actual-browser suite using WebAuthn virtual authenticators, then run
-   the manual platform/roaming-authenticator matrix separately.
-3. Deploy the production overlay into a disposable but cloud-real cluster and
-   execute documented TLS/KMS/Raft/backup/failure drills.
-4. Build the Veil image and EIF twice, record image/EIF hashes and measurements,
-   launch without debug mode, and verify nonce-bound attestation from an
-   independent relying party.
-5. Complete a threat-model review and external audit before any mainnet or
-   production secret.
+1. Retain exact test logs, recording manifests, image manifests/configs, and
+   dependency lockfiles with each release candidate.
+2. Run the separate physical-authenticator/browser matrix against the real
+   backend.
+3. Complete Stripe/Metronome sandbox-to-invoice proof and PostgreSQL
+   migration/restore/HA exercises before enabling billing.
+4. Deploy the production overlay to a disposable cloud-real cluster and run
+   the TLS/KMS/Raft/database/egress/backup/failure drills.
+5. Implement the three missing Nitro boundaries, then run a real same-image
+   quorum and independent hardware-attestation lifecycle.
+6. Complete threat-model and independent audits before any mainnet asset or
+   paid production account.
